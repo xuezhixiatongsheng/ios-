@@ -6,6 +6,6 @@ include $(THEOS)/makefiles/common.mk
 TWEAK_NAME = PiliProbe
 PiliProbe_FILES = Tweak.m
 PiliProbe_CFLAGS = -fobjc-arc -Wno-deprecated-declarations
-PiliProbe_FRAMEWORKS = UIKit Foundation
+PiliProbe_FRAMEWORKS = UIKit Foundation QuartzCore
 
 include $(THEOS_MAKE_PATH)/tweak.mk
