@@ -1,0 +1,35 @@
+name: Build deb
+on:
+  workflow_dispatch:
+  push:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - scheme: rootless
+            theos: https://github.com/theos/theos.git
+          - scheme: roothide
+            theos: https://github.com/roothide/theos.git
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install tools
+        run: brew install ldid dpkg make
+      - name: Get Theos and SDKs
+        run: |
+          git clone --recursive "${{ matrix.theos }}" "$HOME/theos"
+          git clone --depth=1 https://github.com/theos/sdks.git "$HOME/sdks"
+          mkdir -p "$HOME/theos/sdks"
+          cp -R "$HOME"/sdks/*.sdk "$HOME/theos/sdks/"
+          echo "THEOS=$HOME/theos" >> "$GITHUB_ENV"
+      - name: Build
+        run: |
+          export PATH="$(brew --prefix make)/libexec/gnubin:$PATH"
+          make package THEOS_PACKAGE_SCHEME=${{ matrix.scheme }} FINALPACKAGE=1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PiliProbe-${{ matrix.scheme }}
+          path: packages/*.deb
