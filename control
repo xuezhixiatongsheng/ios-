@@ -1,6 +1,6 @@
 Package: com.local.piliprobe
 Name: PiliProbe
-Version: 0.2.0
+Version: 0.5.0
 Architecture: iphoneos-arm
 Description: Diagnose why PiliPlus hangs on the launch screen
 Maintainer: local
