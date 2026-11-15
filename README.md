@@ -1,6 +1,7 @@
 # PiliFix — 让 PiliPlus 在 iOS 17 上能启动
 
-PiliPlus 在很多 iOS 17 设备上会**永久卡在启动图（绿色 P）**：不崩溃、不报错、CPU 不高，换版本、重装、越不越狱都一样。这个仓库只做一件事——修好它。
+PiliPlus 相对路径如果一定会失败，所有 iOS 用户都应该卡住，但显然多数人能正常使用。
+我不清楚为什么其他设备没事，可能与 iOS 版本或 dyld 对相对路径的回退搜索行为有关。我的設備目前診斷出來的結果就是：不崩溃、不报错、CPU 不高，换版本、重装、越不越狱都一样。这个仓库只做一件事——修好它。
 
 安装：在软件源 `https://xuezhixiatongsheng.github.io/ios-/` 里装 `com.xuezhixiatongsheng.pilifix`（支持 roothide 与 rootless）。
 
