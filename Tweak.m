@@ -1,4 +1,6 @@
-// PiliProbe: logs what a Flutter app (PiliPlus) does while it is stuck on its launch screen.
+// PiliProbe 0.2: logs what a Flutter app (PiliPlus) does while it is stuck on its launch screen.
+// New in 0.2: traces messages from the Dart side to native plugins and which ones never got a reply,
+// dumps what every thread is doing, and asks Flutter whether it ever drew its first frame.
 // Output: Documents/piliprobe.log inside the app container, a copy on the clipboard,
 // and an alert after 15 seconds.
 #import <UIKit/UIKit.h>
@@ -7,10 +9,15 @@
 #import <mach-o/dyld.h>
 #import <execinfo.h>
 #import <signal.h>
+#import <dlfcn.h>
+#import <pthread.h>
 #import <sys/utsname.h>
 #import <sys/resource.h>
 #import <fcntl.h>
 #import <unistd.h>
+#if __has_feature(ptrauth_calls)
+#import <ptrauth.h>
+#endif
 
 static int gLogFD = -1;
 static NSString *gLogPath;
@@ -18,10 +25,17 @@ static CFAbsoluteTime gStart;
 static volatile BOOL gSawFinish, gSawActive, gSawWindow, gSawFlutterLoad, gSawFlutterAppear;
 static dispatch_source_t gTimer;
 static void (*gPrevExc)(NSException *);
-static BOOL gHooked;
+static BOOL gHooked, gMsgHooked;
+static volatile unsigned gLines;
+
+static NSObject *gLock;
+static NSMutableDictionary *gPending;
+static uint64_t gSeq;
+static unsigned long gMsgIn, gMsgOut;
 
 static void PPLog(NSString *fmt, ...) NS_FORMAT_FUNCTION(1, 2);
 static void PPLog(NSString *fmt, ...) {
+    if (gLines++ > 6000) return;
     va_list ap;
     va_start(ap, fmt);
     NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:ap];
@@ -78,7 +92,169 @@ static void PPLogImages(const char *label) {
           (unsigned long)names.count, [names componentsJoinedByString:@", "]);
 }
 
-// Hooks that only touch the class itself (never a superclass).
+// ---------- thread dump (no memory allocation while other threads are suspended) ----------
+#define PP_MAXT 48
+#define PP_MAXF 14
+static uintptr_t gFrames[PP_MAXT][PP_MAXF];
+static int gNF[PP_MAXT];
+static char gTName[PP_MAXT][64];
+static double gTCpu[PP_MAXT];
+static int gTState[PP_MAXT];
+
+static uintptr_t PPStrip(uintptr_t p) {
+#if __has_feature(ptrauth_calls)
+    return (uintptr_t)ptrauth_strip((void *)p, ptrauth_key_function_pointer);
+#else
+    return p;
+#endif
+}
+
+static BOOL PPReadWord(uintptr_t addr, uintptr_t *out) {
+    vm_size_t sz = 0;
+    return vm_read_overwrite(mach_task_self(), (vm_address_t)addr, sizeof(uintptr_t),
+                             (vm_address_t)out, &sz) == KERN_SUCCESS && sz == sizeof(uintptr_t);
+}
+
+static void PPDumpThreads(void) {
+    thread_act_array_t list = NULL;
+    mach_msg_type_number_t cnt = 0;
+    if (task_threads(mach_task_self(), &list, &cnt) != KERN_SUCCESS) return;
+    if (cnt > PP_MAXT) cnt = PP_MAXT;
+    thread_t me = mach_thread_self();
+
+    for (mach_msg_type_number_t i = 0; i < cnt; i++) {
+        gTName[i][0] = 0;
+        pthread_t pt = pthread_from_mach_thread_np(list[i]);
+        if (pt) pthread_getname_np(pt, gTName[i], sizeof gTName[i]);
+        thread_basic_info_data_t bi;
+        mach_msg_type_number_t bic = THREAD_BASIC_INFO_COUNT;
+        gTCpu[i] = -1; gTState[i] = 0;
+        if (thread_info(list[i], THREAD_BASIC_INFO, (thread_info_t)&bi, &bic) == KERN_SUCCESS) {
+            gTCpu[i] = bi.user_time.seconds + bi.user_time.microseconds / 1e6
+                     + bi.system_time.seconds + bi.system_time.microseconds / 1e6;
+            gTState[i] = bi.run_state;
+        }
+    }
+
+    // While threads are suspended we must not call malloc, ObjC or logging.
+    for (mach_msg_type_number_t i = 0; i < cnt; i++) {
+        gNF[i] = 0;
+        if (list[i] == me) continue;
+        if (thread_suspend(list[i]) != KERN_SUCCESS) continue;
+        arm_thread_state64_t st;
+        mach_msg_type_number_t sc = ARM_THREAD_STATE64_COUNT;
+        if (thread_get_state(list[i], ARM_THREAD_STATE64, (thread_state_t)&st, &sc) == KERN_SUCCESS) {
+            int n = 0;
+            gFrames[i][n++] = PPStrip(arm_thread_state64_get_pc(st));
+            uintptr_t lr = PPStrip(arm_thread_state64_get_lr(st));
+            if (lr) gFrames[i][n++] = lr;
+            uintptr_t fp = arm_thread_state64_get_fp(st);
+            while (fp && (fp & 0xF) == 0 && n < PP_MAXF) {
+                uintptr_t next = 0, ret = 0;
+                if (!PPReadWord(fp, &next) || !PPReadWord(fp + 8, &ret)) break;
+                ret = PPStrip(ret);
+                if (!ret) break;
+                gFrames[i][n++] = ret;
+                if (next <= fp) break;
+                fp = next;
+            }
+            gNF[i] = n;
+        }
+        thread_resume(list[i]);
+    }
+
+    static const char *kState[] = {"?", "running", "stopped", "waiting", "uninterruptible", "halted"};
+    for (mach_msg_type_number_t i = 0; i < cnt; i++) {
+        int s = gTState[i];
+        PPLog(@"thread %u name='%s' state=%s cpu=%.2fs%s", i, gTName[i],
+              (s >= 0 && s <= 5) ? kState[s] : "?", gTCpu[i], list[i] == me ? " (probe thread)" : "");
+        for (int f = 0; f < gNF[i]; f++) {
+            uintptr_t a = gFrames[i][f];
+            Dl_info di;
+            if (dladdr((void *)a, &di) && di.dli_fname) {
+                const char *img = strrchr(di.dli_fname, '/');
+                img = img ? img + 1 : di.dli_fname;
+                if (di.dli_sname && di.dli_saddr) {
+                    PPLog(@"    %s`%s+%lu", img, di.dli_sname, (unsigned long)(a - (uintptr_t)di.dli_saddr));
+                } else {
+                    PPLog(@"    %s+0x%lx", img, (unsigned long)(a - (uintptr_t)di.dli_fbase));
+                }
+            } else {
+                PPLog(@"    0x%lx", (unsigned long)a);
+            }
+        }
+    }
+    vm_deallocate(mach_task_self(), (vm_address_t)list, cnt * sizeof(thread_t));
+}
+
+// ---------- Dart <-> native message tracing ----------
+static NSString *PPDescribe(NSString *channel, NSData *msg) {
+    NSString *method = @"";
+    const uint8_t *b = (const uint8_t *)msg.bytes;
+    NSUInteger len = msg.length;
+    // StandardMethodCodec starts with a string: 0x07, length, characters (the method name).
+    if (len >= 3 && b[0] == 0x07 && b[1] < 254 && (NSUInteger)b[1] + 2 <= len) {
+        NSString *s = [[NSString alloc] initWithBytes:b + 2 length:b[1] encoding:NSUTF8StringEncoding];
+        if (s) method = [@" / " stringByAppendingString:s];
+    }
+    return [NSString stringWithFormat:@"%@%@ (%lu bytes)", channel, method, (unsigned long)len];
+}
+
+static void PPHookMessenger(void) {
+    if (gMsgHooked) return;
+    Class eng = NSClassFromString(@"FlutterEngine");
+    if (!eng) { PPLog(@"message tracing: FlutterEngine class missing"); return; }
+    SEL sel3 = NSSelectorFromString(@"setMessageHandlerOnChannel:binaryMessageHandler:taskQueue:");
+    SEL sel2 = NSSelectorFromString(@"setMessageHandlerOnChannel:binaryMessageHandler:");
+    BOOL three = class_getInstanceMethod(eng, sel3) != NULL;
+    SEL sel = three ? sel3 : sel2;
+    Method m = class_getInstanceMethod(eng, sel);
+    if (!m) { PPLog(@"message tracing: no suitable FlutterEngine method found"); return; }
+    gMsgHooked = YES;
+    IMP orig = method_getImplementation(m);
+    IMP nu = imp_implementationWithBlock(^int64_t(id s, NSString *channel, id handler, id queue) {
+        id wrapped = handler;
+        if (handler) {
+            void (^h)(NSData *, void (^)(NSData *)) = handler;
+            wrapped = ^(NSData *msg, void (^reply)(NSData *)) {
+                NSString *desc = PPDescribe(channel, msg);
+                NSString *key;
+                @synchronized (gLock) {
+                    key = [NSString stringWithFormat:@"%06llu", ++gSeq];
+                    gPending[key] = @{@"d": desc, @"t": @(CFAbsoluteTimeGetCurrent() - gStart)};
+                    gMsgIn++;
+                }
+                PPLog(@"dart->native #%@ %@", key, desc);
+                h(msg, ^(NSData *r) {
+                    @synchronized (gLock) { [gPending removeObjectForKey:key]; gMsgOut++; }
+                    PPLog(@"native->dart #%@ replied", key);
+                    if (reply) reply(r);
+                });
+            };
+        }
+        if (three) return ((int64_t (*)(id, SEL, id, id, id))orig)(s, sel, channel, wrapped, queue);
+        return ((int64_t (*)(id, SEL, id, id))orig)(s, sel, channel, wrapped);
+    });
+    if (!class_addMethod(eng, sel, nu, method_getTypeEncoding(m))) method_setImplementation(m, nu);
+    PPLog(@"message tracing installed on %@", NSStringFromSelector(sel));
+}
+
+static NSString *PPPendingSummary(NSUInteger maxLines) {
+    NSMutableString *out = [NSMutableString string];
+    @synchronized (gLock) {
+        NSArray *keys = [gPending.allKeys sortedArrayUsingSelector:@selector(compare:)];
+        [out appendFormat:@"%lu 條訊息仍在等待回覆", (unsigned long)keys.count];
+        NSUInteger shown = 0;
+        for (NSString *k in keys) {
+            if (shown++ >= maxLines) { [out appendString:@"\n  ..."]; break; }
+            NSDictionary *info = gPending[k];
+            [out appendFormat:@"\n  #%@ (+%.1fs) %@", k, [info[@"t"] doubleValue], info[@"d"]];
+        }
+    }
+    return out;
+}
+
+// ---------- Flutter / UIKit hooks ----------
 static void PPHook0(Class cls, SEL sel, const char *tag, volatile BOOL *flag) {
     Method m = class_getInstanceMethod(cls, sel);
     if (!m) { PPLog(@"hook skipped (method missing): %s", tag); return; }
@@ -104,6 +280,7 @@ static void PPHookBool(Class cls, SEL sel, const char *tag, volatile BOOL *flag)
 }
 
 static void PPInstallHooks(void) {
+    PPHookMessenger();
     if (gHooked) return;
     Class vc = NSClassFromString(@"FlutterViewController");
     Class eng = NSClassFromString(@"FlutterEngine");
@@ -119,13 +296,7 @@ static NSString *PPFullLog(void) {
     return [NSString stringWithContentsOfFile:gLogPath encoding:NSUTF8StringEncoding error:nil] ?: @"";
 }
 
-static NSString *PPTail(NSUInteger n) {
-    NSArray *lines = [PPFullLog() componentsSeparatedByString:@"\n"];
-    if (lines.count > n) lines = [lines subarrayWithRange:NSMakeRange(lines.count - n, n)];
-    return [lines componentsJoinedByString:@"\n"];
-}
-
-static UIViewController *PPTopVC(void) {
+static UIWindow *PPKeyWindow(void) {
     UIWindow *win = nil;
     for (UIScene *sc in UIApplication.sharedApplication.connectedScenes) {
         if ([sc isKindOfClass:UIWindowScene.class]) {
@@ -136,7 +307,11 @@ static UIViewController *PPTopVC(void) {
         if (win) break;
     }
     if (!win) win = UIApplication.sharedApplication.windows.firstObject;
-    UIViewController *vc = win.rootViewController;
+    return win;
+}
+
+static UIViewController *PPTopVC(void) {
+    UIViewController *vc = PPKeyWindow().rootViewController;
     while (vc.presentedViewController) vc = vc.presentedViewController;
     return vc;
 }
@@ -145,13 +320,26 @@ static void PPReport(void) {
     PPLog(@"=== REPORT === didFinishLaunching=%d didBecomeActive=%d window=%d flutterVCLoaded=%d flutterVCAppeared=%d",
           gSawFinish, gSawActive, gSawWindow, gSawFlutterLoad, gSawFlutterAppear);
     PPLogImages("final images");
-    NSString *full = PPFullLog();
-    [UIPasteboard generalPasteboard].string = full;
-    NSString *msg = [NSString stringWithFormat:@"完整日誌已複製到剪貼簿，直接貼給 Claude 即可。\n\n%@", PPTail(16)];
+    unsigned long in, out;
+    @synchronized (gLock) { in = gMsgIn; out = gMsgOut; }
+    PPLog(@"messages from Dart to native plugins: %lu received, %lu replied. %@", in, out, PPPendingSummary(40));
+    PPDumpThreads();
+    [UIPasteboard generalPasteboard].string = PPFullLog();
+
     dispatch_async(dispatch_get_main_queue(), ^{
+        NSString *frame = @"未知";
+        @try {
+            id v = [PPKeyWindow().rootViewController valueForKey:@"displayingFlutterUI"];
+            if (v) frame = [v boolValue] ? @"是（畫面已畫出）" : @"否（一直沒畫出第一幀）";
+        } @catch (NSException *e) {}
+        PPLog(@"Flutter first frame rendered: %@", frame);
+        [UIPasteboard generalPasteboard].string = PPFullLog();
+
         UIViewController *top = PPTopVC();
         if (!top) { PPLog(@"alert skipped: no view controller"); return; }
-        UIAlertController *a = [UIAlertController alertControllerWithTitle:@"PiliProbe" message:msg
+        NSString *msg = [NSString stringWithFormat:@"完整日誌已複製到剪貼簿，貼給 Claude 即可。\n\n第一幀已畫出：%@\n%@",
+                         frame, PPPendingSummary(6)];
+        UIAlertController *a = [UIAlertController alertControllerWithTitle:@"PiliProbe 0.2" message:msg
                                                             preferredStyle:UIAlertControllerStyleAlert];
         [a addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
         [top presentViewController:a animated:YES completion:nil];
@@ -182,31 +370,25 @@ __attribute__((constructor)) static void PPInit(void) {
         if ([all rangeOfString:@"pili"].location == NSNotFound) return; // only touch PiliPlus
 
         gStart = CFAbsoluteTimeGetCurrent();
+        gLock = [NSObject new];
+        gPending = [NSMutableDictionary dictionary];
         NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject ?: NSTemporaryDirectory();
         gLogPath = [docs stringByAppendingPathComponent:@"piliprobe.log"];
         gLogFD = open(gLogPath.fileSystemRepresentation, O_WRONLY | O_CREAT | O_TRUNC | O_APPEND, 0644);
 
         struct utsname u;
         uname(&u);
-        PPLog(@"PiliProbe 0.1 started. device=%s iOS=%@ bundle=%@ version=%@(%@) exe=%@",
+        PPLog(@"PiliProbe 0.2 started. device=%s iOS=%@ bundle=%@ version=%@(%@) exe=%@",
               u.machine, UIDevice.currentDevice.systemVersion, bid,
               [b objectForInfoDictionaryKey:@"CFBundleShortVersionString"],
               [b objectForInfoDictionaryKey:@"CFBundleVersion"], exe);
         PPLog(@"log file: %@", gLogPath);
 
-        NSDictionary *fs = [NSFileManager.defaultManager attributesOfFileSystemForPath:NSHomeDirectory() error:nil];
-        PPLog(@"free disk: %.1f GB", [fs[NSFileSystemFreeSize] doubleValue] / 1e9);
-
         NSString *fw = b.privateFrameworksPath;
         NSFileManager *fm = NSFileManager.defaultManager;
         NSArray *items = [fm contentsOfDirectoryAtPath:fw error:nil];
         PPLog(@"Frameworks (%lu): %@", (unsigned long)items.count, [items componentsJoinedByString:@", "]);
-        PPLog(@"Flutter binary exists: %d", [fm fileExistsAtPath:[fw stringByAppendingPathComponent:@"Flutter.framework/Flutter"]]);
-        PPLog(@"App.framework/App exists: %d", [fm fileExistsAtPath:[fw stringByAppendingPathComponent:@"App.framework/App"]]);
-        PPLog(@"flutter_assets exists: %d", [fm fileExistsAtPath:[fw stringByAppendingPathComponent:@"App.framework/flutter_assets"]]);
-        PPLog(@"debug-build marker (kernel_blob.bin) exists: %d (1 would mean a debug build, which cannot run from the home screen)",
-              [fm fileExistsAtPath:[fw stringByAppendingPathComponent:@"App.framework/flutter_assets/kernel_blob.bin"]]);
-        PPLogImages("startup images");
+        PPLog(@"debug-build marker (kernel_blob.bin) exists: %d", [fm fileExistsAtPath:[fw stringByAppendingPathComponent:@"App.framework/flutter_assets/kernel_blob.bin"]]);
 
         signal(SIGABRT, PPSignal); signal(SIGSEGV, PPSignal); signal(SIGBUS, PPSignal);
         signal(SIGILL, PPSignal);  signal(SIGFPE, PPSignal);  signal(SIGTRAP, PPSignal);
